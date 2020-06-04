@@ -1,7 +1,7 @@
 package ntlm2basic
 
 import (
-	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -9,141 +9,78 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/Azure/go-ntlmssp"
+	"github.com/google/uuid"
 )
+
+var cookieName = "ntlm-proxy-sessionid"
 
 type Server struct {
 	ServerConfig
-	transport *http.Transport
-	proxy     *httputil.ReverseProxy
+	transport   *http.Transport
+	noAuthProxy *httputil.ReverseProxy
+	proxyMap    ProxyMap
 }
 
 type ServerConfig struct {
-	BindAddr    string
-	UpstreamURL *url.URL
-	Domain      string
-	EnableDump  bool
+	BindAddr                       string
+	UpstreamURL                    *url.URL
+	Domain                         string
+	EnableDump                     bool
+	RewriteHostHeader              string
+	MaxSessionIdleTimeoutInSeconds time.Duration
+}
+
+type ProxyMap struct {
+	s sync.Map
+}
+
+func (s *ProxyMap) Store(sessionId, username string, value *httputil.ReverseProxy) {
+	s.s.Store(sessionId+"/"+username, value)
+}
+
+func (s *ProxyMap) Load(sessionId, username string) (*httputil.ReverseProxy, error) {
+	v, ok := s.s.Load(sessionId + "/" + username)
+	if !ok {
+		return nil, errors.New("not found")
+	}
+
+	t, ok := v.(*httputil.ReverseProxy)
+	if !ok {
+		return nil, errors.New("stored type is invalid")
+	}
+
+	return t, nil
 }
 
 func NewServer(config *ServerConfig) *Server {
-	proxy := httputil.NewSingleHostReverseProxy(config.UpstreamURL)
-	proxy.ModifyResponse = func(resp *http.Response) error {
-		dumpNTLMResponse(config, resp, "NotAuthorized")
-
+	noAuthProxy := httputil.NewSingleHostReverseProxy(config.UpstreamURL)
+	noAuthProxy.ModifyResponse = func(resp *http.Response) error {
 		if isNTLMRequired(resp) {
-			if _, _, ok := resp.Request.BasicAuth(); !ok {
-				return fmt.Errorf("NotAuthorized")
-			} else {
-				return fmt.Errorf("Authenticating")
-			}
+			return fmt.Errorf("NotAuthorized")
 		}
 		return nil
 	}
-	proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+	noAuthProxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
 		log.Printf("info: handleError: %s", err.Error())
 		if err.Error() == "NotAuthorized" {
 			rw.Header().Add("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, config.Domain))
 			http.Error(rw, "Not authorized", http.StatusUnauthorized)
 			return
 		}
-		if err.Error() == "Authenticating" {
-			user, password, ok := req.BasicAuth()
-			if !ok {
-				log.Printf("error: unexpcted authenticating flow, try to re-authenticate")
 
-				rw.Header().Add("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, config.Domain))
-				http.Error(rw, "Not authorized", http.StatusUnauthorized)
-				return
-			}
-
-			log.Printf("info: Authenticating with NTLM. user: %s", user)
-
-			client := &http.Client{
-				Transport: ntlmssp.Negotiator{
-					RoundTripper: &http.Transport{},
-				},
-			}
-
-			ctx := req.Context()
-			if cn, ok := rw.(http.CloseNotifier); ok {
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithCancel(ctx)
-				defer cancel()
-				notifyChan := cn.CloseNotify()
-				go func() {
-					select {
-					case <-notifyChan:
-						cancel()
-					case <-ctx.Done():
-					}
-				}()
-			}
-
-			outreq := req.Clone(ctx)
-			if req.ContentLength == 0 {
-				outreq.Body = nil // Issue 16036: nil Body for http.Transport retries
-			}
-			if outreq.Header == nil {
-				outreq.Header = make(http.Header) // Issue 33142: historical behavior was to always allocate
-			}
-
-			target := config.UpstreamURL
-			targetQuery := target.RawQuery
-
-			outreq.URL.Scheme = target.Scheme
-			outreq.URL.Host = target.Host
-			outreq.URL.Path = singleJoiningSlash(target.Path, outreq.URL.Path)
-			if targetQuery == "" || outreq.URL.RawQuery == "" {
-				outreq.URL.RawQuery = targetQuery + outreq.URL.RawQuery
-			} else {
-				outreq.URL.RawQuery = targetQuery + "&" + outreq.URL.RawQuery
-			}
-			if _, ok := outreq.Header["User-Agent"]; !ok {
-				// explicitly disable User-Agent so it's not set to default value
-				outreq.Header.Set("User-Agent", "")
-			}
-
-			outreq.Close = false
-			outreq.SetBasicAuth(user, password)
-
-			dumpRequest(config, outreq)
-
-			resp, err := client.Do(outreq)
-			if err != nil {
-				log.Printf("error: Faild to read response. host: %v, err: %v", outreq.URL.Host, err.Error())
-				if resp == nil {
-					http.Error(rw, err.Error(), 500)
-					return
-				}
-			}
-
-			dumpNTLMResponse(config, resp, "Authenticating")
-
-			if isNTLMRequired(resp) {
-				log.Printf("warn: failed to authenticate with NTLM. user: %s", user)
-
-				rw.Header().Add("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, config.Domain))
-				rw.WriteHeader(http.StatusUnauthorized)
-				http.Error(rw, "Not authorized", 401)
-				return
-			}
-
-			log.Printf("info: authenticated with NTLM. user: %s", user)
-
-			writeResponse(rw, resp)
-
-			return
-		}
-
-		log.Printf("error: proxy error: %v", err)
+		log.Printf("error: proxy error with normal connection: %v", err)
 		rw.WriteHeader(http.StatusBadGateway)
 	}
 
 	s := &Server{
 		ServerConfig: *config,
 		transport:    &http.Transport{},
-		proxy:        proxy,
+		noAuthProxy:  noAuthProxy,
+		proxyMap:     ProxyMap{},
 	}
 
 	return s
@@ -158,9 +95,82 @@ func (s *Server) Start() error {
 }
 
 func (s *Server) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	if s.RewriteHostHeader != "" {
+		req.Header.Del("Host")
+		req.Header.Set("Host", s.RewriteHostHeader)
+	}
+
 	dumpRequest(&s.ServerConfig, req)
 
-	s.proxy.ServeHTTP(rw, req)
+	if user, _, ok := req.BasicAuth(); ok {
+		// When already authenticated, find the connection and proxy through the connection
+		if cookie, err := req.Cookie(cookieName); cookie != nil && err != http.ErrNoCookie {
+			log.Printf("debug: cookie: %v", cookie)
+
+			if proxy, err := s.proxyMap.Load(cookie.Value, user); err != nil {
+				proxy.ServeHTTP(rw, req)
+				return
+			}
+		}
+
+		proxy := httputil.NewSingleHostReverseProxy(s.UpstreamURL)
+		proxy.Transport = ntlmssp.Negotiator{
+			RoundTripper: &http.Transport{
+				MaxConnsPerHost:     1,
+				MaxIdleConnsPerHost: 1,
+				MaxIdleConns:        1,
+				IdleConnTimeout:     s.MaxSessionIdleTimeoutInSeconds * time.Second,
+			},
+		}
+		proxy.ModifyResponse = func(resp *http.Response) error {
+			if isNTLMRequired(resp) {
+				dumpNTLMResponse(&s.ServerConfig, resp, "NotAuthorized")
+
+				if cookie, err := req.Cookie(cookieName); err != nil {
+					log.Printf("info: detected losting the authenticated connection. need to re-authentication. user: %s", user)
+					// Remove current cookie
+					cookie.MaxAge = -1
+					resp.Header.Add("Set-Cookie", cookie.String())
+
+				} else {
+					log.Printf("info: invalid username or credential. user: %s", user)
+				}
+
+				return fmt.Errorf("NotAuthorized")
+			}
+			// Authenticated
+			log.Printf("info: authenticated. user: %s", user)
+
+			uuid := uuid.New().String()
+			cookie := &http.Cookie{
+				Name:  cookieName,
+				Value: uuid,
+			}
+			resp.Header.Add("Set-Cookie", cookie.String())
+
+			// Save
+			s.proxyMap.Store(uuid, user, proxy)
+
+			return nil
+		}
+		proxy.ErrorHandler = func(rw http.ResponseWriter, req *http.Request, err error) {
+			if err.Error() == "NotAuthorized" {
+				rw.Header().Add("WWW-Authenticate", fmt.Sprintf(`Basic realm="%s"`, s.Domain))
+				http.Error(rw, "Not authorized", http.StatusUnauthorized)
+				return
+			}
+
+			log.Printf("error: proxy error when authenticating: %v", err)
+			rw.WriteHeader(http.StatusBadGateway)
+		}
+
+		// Proxy with authenticated connection
+		proxy.ServeHTTP(rw, req)
+		return
+	}
+
+	// Proxy with normal connection
+	s.noAuthProxy.ServeHTTP(rw, req)
 }
 
 func isNTLMRequired(res *http.Response) bool {

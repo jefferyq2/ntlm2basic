@@ -19,9 +19,11 @@ var (
 
 	fs = flag.NewFlagSet(os.Args[0], flag.ExitOnError)
 
-	bindAddr    = fs.String("b", ":3128", "Bind address and port")
-	domain      = fs.String("d", "", "Domain")
-	upstreamURL = fs.String("u", "", "Upstream URL")
+	bindAddr                       = fs.String("b", ":3128", "Bind address and port")
+	domain                         = fs.String("d", "", "Domain")
+	upstreamURL                    = fs.String("u", "", "Upstream URL")
+	rewriteHostHeader              = fs.String("r", "", "Rewrite host header")
+	maxSessionIdleTimeoutInSeconds = fs.Duration("s", 600, "Max session idle timeout in seconds")
 
 	loglevel = fs.String(
 		"log-level",
@@ -67,10 +69,12 @@ func main() {
 	}
 
 	f := proxy.NewServer(&proxy.ServerConfig{
-		BindAddr:    *bindAddr,
-		UpstreamURL: upURL,
-		Domain:      *domain,
-		EnableDump:  *enableDump,
+		BindAddr:                       *bindAddr,
+		UpstreamURL:                    upURL,
+		Domain:                         *domain,
+		RewriteHostHeader:              *rewriteHostHeader,
+		EnableDump:                     *enableDump,
+		MaxSessionIdleTimeoutInSeconds: *maxSessionIdleTimeoutInSeconds,
 	})
 
 	log.Printf("info: Starting ntlm2basic: %s", *bindAddr)
